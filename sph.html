@@ -1,0 +1,714 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta name="viewport" content="width=600">
+<title>WebGPU SPH</title>
+<script src="third_party/shaderc/shaderc.js"></script>
+</head>
+<body>
+<canvas height=800 width=800></canvas>
+<script>
+async function testPrefixSum(device, pipeline, bgl, testSize, factor) {
+    const testData = [];
+    for (let i = 0; i < testSize; i++) {
+        testData.push(Math.floor(Math.random() * 1000));
+    }
+    const testBuffer = device.createBuffer({
+        size: testSize * 4,
+        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.TRANSFER_DST,
+    });
+    testBuffer.setSubData(0, new Uint32Array(testData));
+
+    const resultBuffer = device.createBuffer({
+        size: testSize * 4,
+        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.TRANSFER_SRC
+    });
+    const readbackBuffer = device.createBuffer({
+        size: testSize * 4,
+        usage: GPUBufferUsage.TRANSFER_DST | GPUBufferUsage.MAP_READ
+    });
+
+    const encoder = device.createCommandEncoder({});
+
+    const bindGroup = device.createBindGroup({
+        layout: bgl,
+        bindings: [
+            {binding: 0, resource: {buffer: testBuffer, offset: 0, size: testSize * 4}},
+            {binding: 1, resource: {buffer: resultBuffer, offset: 0, size: testSize * 4}},
+        ],
+    });
+
+    const pass = encoder.beginComputePass();
+    pass.setPipeline(pipeline);
+    pass.setBindGroup(0, bindGroup);
+    pass.dispatch(factor);
+    pass.endPass();
+
+    encoder.copyBufferToBuffer(resultBuffer, 0, readbackBuffer, 0, testSize * 4);
+    console.log("testing")
+    device.getQueue().submit([encoder.finish()]);
+
+    const resultData = new Uint32Array(await readbackBuffer.mapReadAsync());
+
+    let sum = 0;
+    for (let i = 0; i < testSize; i++) {
+        if (resultData[i] != sum) {
+            console.log(i, "error ", resultData[i], " " , sum);
+        }
+        sum += testData[i];
+    }
+    console.log("test ok");
+}
+
+function compileShaderModule(device, type, source) {
+    const Shaderc = window.Module;
+
+    const compiler = new Shaderc.Compiler();
+    const opts = new Shaderc.CompileOptions();
+    const result = compiler.CompileGlslToSpv("#version 450\n" + source,
+        type === "f" ? Shaderc.shader_kind.fragment :
+        type === "v" ? Shaderc.shader_kind.vertex :
+        type === "c" ? Shaderc.shader_kind.compute : null,
+        "a.glsl", "main", opts);
+    const message = result.GetErrorMessage();
+    if (message != "") {
+        console.warn(message);
+    }
+    return device.createShaderModule({code: result.GetBinary()});
+}
+
+const onRuntimeInitialized = new Promise(resolve => {
+    Module.onRuntimeInitialized = resolve;
+});
+
+const SHADER_HEADER = `
+struct Particle {
+    vec2 pos;
+    vec2 vel;
+    vec2 accel;
+    vec2 force;
+    float average_weight;
+    float pressure;
+    vec2 dummy;
+};
+
+struct Constants {
+    uvec2 screenSize;
+    uint gridSize;
+    float timestep;
+    float g;
+    float mass;
+    float epsilon;
+    float metaballVolumeThreshold;
+    float metaballSurfaceThreshold;
+};
+`;
+const PARTICLE_SIZE = 12 // sizeof Particle / sizeof float;
+const N_PARTICLES_SQRT = 150;
+const N_PARTICLES = N_PARTICLES_SQRT * N_PARTICLES_SQRT;
+const GRID_SIZE = N_PARTICLES_SQRT * 2;
+const N_GRID_CELLS = GRID_SIZE * GRID_SIZE;
+const RADIUS = 1.0 / 2 / GRID_SIZE * 3 * 2;
+const INTERACTION_RADIUS = 0.03333;
+//const META_THRESHOLD = 100000.0;
+
+async function init() {
+    await onRuntimeInitialized;
+    const adapter = await navigator.gpu.requestAdapter();
+    const device = await adapter.requestDevice();
+
+    const canvas = document.querySelector('canvas');
+    const context = canvas.getContext('gpupresent');
+    const swapChain = context.configureSwapChain({
+        device,
+        format: "bgra8unorm"
+    });
+
+    // -------------------------------------------- DOTS
+    const dotsVSCode = `
+        layout(location = 0) in vec2 position;
+        void main() {
+            gl_Position = vec4(position * 2.0 - vec2(1.0), 0.0, 1.0);
+        }
+    `;
+
+    const dotsFSCode = `
+        layout(location = 0) out vec4 fragColor;
+        void main() {
+            fragColor = vec4(1.0);
+        }
+    `;
+
+    const dotsPipeline = device.createRenderPipeline({
+        layout: device.createPipelineLayout({ bindGroupLayouts: [] }),
+        vertexStage: {
+            module: compileShaderModule(device, "v", dotsVSCode),
+            entryPoint: "main"
+        },
+        fragmentStage: {
+            module: compileShaderModule(device, "f", dotsFSCode),
+            entryPoint: "main"
+        },
+        primitiveTopology: "point-list",
+
+        vertexInput: {
+            indexFormat: "uint32",
+            vertexBuffers: [{
+                stride: 4 * PARTICLE_SIZE,
+                attributes: [{
+                    shaderLocation: 0,
+                    offset: 0,
+                    format: "float2"
+                }],
+            }],
+        },
+
+        rasterizationState: {
+            frontFace: 'ccw',
+        },
+
+        colorStates: [{
+            format: "bgra8unorm",
+            alphaBlend: {},
+            colorBlend: {},
+        }],
+    });
+
+    // -------------------------------------------- METABALLS
+    const metaballVSCode = `
+        const vec2 pos[4] = vec2[4](
+            vec2( 1.0f, -1.0f),
+            vec2( 1.0f,  1.0f),
+            vec2(-1.0f, -1.0f),
+            vec2(-1.0f,  1.0f)
+        );
+
+        void main() {
+            gl_Position = vec4(pos[gl_VertexIndex], 0.0, 1.0);
+        }
+    `;
+
+    const metaballFSCode = SHADER_HEADER + `
+        layout(std140, set = 0, binding = 0) uniform Uniforms {
+            Constants constants;
+        };
+
+        layout(std430, set = 0, binding = 1) buffer ParticlesIn {
+            Particle particles[];
+        };
+
+        layout(std430, set = 0, binding = 2) buffer Prefixes {
+            uint gridPrefixSum[];
+        };
+
+        layout(std430, set = 0, binding = 3) buffer CountsOut {
+            uint gridCounts[];
+        };
+
+        layout(location = 0) out vec4 fragColor;
+        void main() {
+            float squareSum = 0.0;
+            vec2 pos = gl_FragCoord.xy / constants.screenSize;
+            ivec2 gridPos = ivec2(floor(pos * constants.gridSize));
+
+            ivec2 start = max(ivec2(0), gridPos - ivec2(4));
+            ivec2 end = min(ivec2(constants.gridSize), gridPos + ivec2(5));
+            for (uint x = start.x; x < end.x; x++) {
+                for (uint y = start.y; y < end.y; y++) {
+                    uint cellIndex = x + constants.gridSize * y;
+                    uint offset = gridPrefixSum[cellIndex];
+                    uint particleCount = gridCounts[cellIndex];
+                    for (uint i = 0; i < particleCount; i++) {
+                        vec2 particlePos = particles[offset + i].pos;
+                        vec2 diff = particlePos - pos;
+                        squareSum += 1.0 / max(constants.epsilon, dot(diff, diff));
+                        if (squareSum > constants.metaballVolumeThreshold) {
+                            fragColor = vec4(0.15, 0.3, 0.6, 1.0);
+                            return;
+                        }
+                    }
+                }
+            }
+
+            if (squareSum > constants.metaballSurfaceThreshold) {
+                fragColor = vec4(0.3, 0.5, 0.8, 1.0);
+                return;
+            }
+            discard;
+        }
+    `;
+
+    const metaballBGL = device.createBindGroupLayout({
+        bindings: [
+            { binding: 0, visibility: GPUShaderStageBit.FRAGMENT, type: "uniform-buffer" },
+            { binding: 1, visibility: GPUShaderStageBit.FRAGMENT, type: "storage-buffer" },
+            { binding: 2, visibility: GPUShaderStageBit.FRAGMENT, type: "storage-buffer" },
+            { binding: 3, visibility: GPUShaderStageBit.FRAGMENT, type: "storage-buffer" },
+        ]
+    });
+
+    const metaballPipeline = device.createRenderPipeline({
+        layout: device.createPipelineLayout({ bindGroupLayouts: [metaballBGL] }),
+        vertexStage: {
+            module: compileShaderModule(device, "v", metaballVSCode),
+            entryPoint: "main"
+        },
+        fragmentStage: {
+            module: compileShaderModule(device, "f", metaballFSCode),
+            entryPoint: "main"
+        },
+        primitiveTopology: "triangle-strip",
+
+        vertexInput: {
+            indexFormat: "uint32",
+            vertexBuffers: [],
+        },
+
+        rasterizationState: {
+            frontFace: 'ccw',
+        },
+
+        colorStates: [{
+            format: "bgra8unorm",
+            alphaBlend: {},
+            colorBlend: {},
+        }],
+    });
+
+    // -------------------------------------------- ADVECTION
+    const advectCSCode = SHADER_HEADER + `
+        layout(std140, set = 0, binding = 0) uniform Uniforms {
+            Constants constants;
+        };
+
+        layout(std430, set = 0, binding = 1) buffer ParticlesIn {
+            Particle particlesIn[];
+        };
+
+        layout(std430, set = 0, binding = 2) buffer ParticlesOut {
+            Particle particlesOut[];
+        };
+
+        void main() {
+            uint index = gl_GlobalInvocationID.x;
+
+            Particle particle = particlesIn[index];
+            // Seems wrong, multiplication by mass should be somewhere else.
+            vec2 acceleration = particle.accel + particle.force;
+            particle.vel += acceleration * constants.mass * constants.timestep;
+            particle.vel.y -= constants.g * constants.timestep / 100.0; // Why?
+            particle.pos += particle.vel * constants.timestep;
+
+            // Elastic bouncing over the boundaries
+            vec2 newPos = clamp(particle.pos, constants.epsilon, 1.0 - constants.epsilon);
+            if (newPos.x != particle.pos.x) {
+                particle.vel.x *= -0.5;
+            }
+            if (newPos.y != particle.pos.y) {
+                particle.vel.y *= -0.5;
+            }
+
+            particlesOut[index] = particle;
+        }
+    `;
+    const advectionBGL = device.createBindGroupLayout({
+        bindings: [
+            { binding: 0, visibility: GPUShaderStageBit.COMPUTE, type: "uniform-buffer" },
+            { binding: 1, visibility: GPUShaderStageBit.COMPUTE, type: "storage-buffer" },
+            { binding: 2, visibility: GPUShaderStageBit.COMPUTE, type: "storage-buffer" },
+        ]
+    });
+    const advectionPipeline = device.createComputePipeline({
+        layout: device.createPipelineLayout({ bindGroupLayouts: [advectionBGL] }),
+        computeStage: {
+            module: compileShaderModule(device, "c", advectCSCode),
+            entryPoint: "main",
+        },
+    });
+
+    // -------------------------------------------- ZERO BUFFER
+    const zeroBufferCSCode = `
+        layout(std430, set = 0, binding = 0) buffer ToZero {
+             uint data[];
+        };
+        void main() {
+            data[gl_GlobalInvocationID.x] = 0;
+        }
+    `;
+    const zeroBufferBGL = device.createBindGroupLayout({
+        bindings: [
+            { binding: 0, visibility: GPUShaderStageBit.COMPUTE, type: "storage-buffer" },
+        ]
+    });
+    const zeroBufferPipeline = device.createComputePipeline({
+        layout: device.createPipelineLayout({ bindGroupLayouts: [zeroBufferBGL] }),
+        computeStage: {
+            module: compileShaderModule(device, "c", zeroBufferCSCode),
+            entryPoint: "main",
+        },
+    });
+
+    // -------------------------------------------- SINGLE DISPATCH PREFIX SUM (SLOW!!!!)
+    const prefixSumCSCode = `
+        layout(std430, set = 0, binding = 0) buffer DataIn {
+            uint dataIn[];
+        };
+
+        layout(std430, set = 0, binding = 1) buffer DataOut {
+            uint dataOut[];
+        };
+
+        const uint kFactor = 256;
+        layout(local_size_x = kFactor) in;
+        shared uint coarsePrefixes[kFactor];
+
+        void main() {
+            uint dataLength = ${N_GRID_CELLS};// dataIn.data.length(); // XXX roll shaderc to fix this.
+            uint groupSize = (dataLength + kFactor - 1) / kFactor;
+            uint index = gl_GlobalInvocationID.x;
+
+            if (index != 0) {
+                uint start = (index - 1) * groupSize;
+                uint end = index * groupSize;
+
+                uint sum = 0;
+                for (uint i = start; i < end; i++) {
+                    sum += dataIn[i];
+                }
+                coarsePrefixes[index] = sum;
+            }
+            barrier();
+
+            if (index == 0) {
+                coarsePrefixes[0] = 0;
+
+                uint sum = 0;
+                for (uint i = 1; i < kFactor; i++) {
+                    sum += coarsePrefixes[i];
+                    coarsePrefixes[i] = sum;
+                }
+            }
+            barrier();
+
+            uint start = index * groupSize;
+            uint end = min((index + 1) * groupSize, dataLength);
+
+            uint sum = coarsePrefixes[index];
+            for (uint i = start; i < end; i++) {
+                dataOut[i] = sum;
+                sum += dataIn[i];
+            }
+        }
+    `;
+    const prefixSumBGL = device.createBindGroupLayout({
+        bindings: [
+            { binding: 0, visibility: GPUShaderStageBit.COMPUTE, type: "storage-buffer" },
+            { binding: 1, visibility: GPUShaderStageBit.COMPUTE, type: "storage-buffer" },
+        ]
+    });
+    const prefixSumPipeline = device.createComputePipeline({
+        layout: device.createPipelineLayout({ bindGroupLayouts: [prefixSumBGL] }),
+        computeStage: {
+            module: compileShaderModule(device, "c", prefixSumCSCode),
+            entryPoint: "main",
+        },
+    });
+
+    // await testPrefixSum(device, prefixSumPipeline, prefixSumBGL, N_GRID_CELLS, 256)
+
+    // -------------------------------------------- COUNT PARTICLES
+    const countParticlesCSCode = SHADER_HEADER + `
+        layout(std140, set = 0, binding = 0) uniform Uniforms {
+            Constants constants;
+        };
+
+        layout(std430, set = 0, binding = 1) buffer ParticlesIn {
+            Particle particles[];
+        };
+
+        layout(std430, set = 0, binding = 2) buffer CountsOut {
+            uint counts[];
+        };
+
+        void main() {
+            uint index = gl_GlobalInvocationID.x;
+
+            vec2 pos = particles[index].pos;
+            pos = clamp(pos, 0.0, 1.0);
+            ivec2 gridPos = ivec2(floor(pos * constants.gridSize));
+            uint gridOffset = gridPos.x + constants.gridSize * gridPos.y;
+            atomicAdd(counts[gridOffset], 1);
+        }
+    `;
+    const countParticlesBGL = device.createBindGroupLayout({
+        bindings: [
+            { binding: 0, visibility: GPUShaderStageBit.COMPUTE, type: "uniform-buffer" },
+            { binding: 1, visibility: GPUShaderStageBit.COMPUTE, type: "storage-buffer" },
+            { binding: 2, visibility: GPUShaderStageBit.COMPUTE, type: "storage-buffer" },
+        ]
+    });
+    const countParticlesPipeline = device.createComputePipeline({
+        layout: device.createPipelineLayout({ bindGroupLayouts: [countParticlesBGL] }),
+        computeStage: {
+            module: compileShaderModule(device, "c", countParticlesCSCode),
+            entryPoint: "main",
+        },
+    });
+
+    // -------------------------------------------- REORDER PARTICLES
+    const reorderParticlesCSCode = SHADER_HEADER + `
+        layout(std140, set = 0, binding = 0) uniform Uniforms {
+            Constants constants;
+        };
+
+        layout(std430, set = 0, binding = 1) buffer ParticlesIn {
+            Particle particlesIn[];
+        };
+
+        layout(std430, set = 0, binding = 2) buffer ParticlesOut {
+            Particle particlesOut[];
+        };
+
+        layout(std430, set = 0, binding = 3) buffer Prefixes {
+            uint prefixSum[];
+        };
+
+        layout(std430, set = 0, binding = 4) buffer CountsOut {
+            uint counts[];
+        };
+
+        void main() {
+            uint index = gl_GlobalInvocationID.x;
+
+            vec2 pos = particlesIn[index].pos;
+            pos = clamp(pos, 0.0, 1.0);
+            ivec2 gridPos = ivec2(floor(pos * constants.gridSize));
+            uint gridOffset = gridPos.x + constants.gridSize * gridPos.y;
+
+            uint previousCount = atomicAdd(counts[gridOffset], 1);
+            uint newIndex = previousCount + prefixSum[gridOffset];
+            particlesOut[newIndex] = particlesIn[index];
+        }
+    `;
+    const reorderParticlesBGL = device.createBindGroupLayout({
+        bindings: [
+            { binding: 0, visibility: GPUShaderStageBit.COMPUTE, type: "uniform-buffer" },
+            { binding: 1, visibility: GPUShaderStageBit.COMPUTE, type: "storage-buffer" },
+            { binding: 2, visibility: GPUShaderStageBit.COMPUTE, type: "storage-buffer" },
+            { binding: 3, visibility: GPUShaderStageBit.COMPUTE, type: "storage-buffer" },
+            { binding: 4, visibility: GPUShaderStageBit.COMPUTE, type: "storage-buffer" },
+        ]
+    });
+    const reorderParticlesPipeline = device.createComputePipeline({
+        layout: device.createPipelineLayout({ bindGroupLayouts: [reorderParticlesBGL] }),
+        computeStage: {
+            module: compileShaderModule(device, "c", reorderParticlesCSCode),
+            entryPoint: "main",
+        },
+    });
+
+    // -------------------------------------------- BUFFER SETUP
+    const constantsData = new Float32Array([
+        0, 0, // screenSize
+        0, // gridSize
+        0.05, // timestep
+        4.0, // g
+        0.001, // mass
+        0.0000001, // epsilon
+        100000.0, // metaballVolumeThreshold
+        25000.0, // metaballSurfaceThreshold
+    ]);
+    const constantsDataUint = new Uint32Array(constantsData.buffer);
+    constantsDataUint[0] = 800;
+    constantsDataUint[1] = 800;
+    constantsDataUint[2] = GRID_SIZE;
+
+    const constantsBuffer = device.createBuffer({
+        size: constantsData.length * 4,
+        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.TRANSFER_DST
+    });
+    constantsBuffer.setSubData(0, constantsData);
+
+    const particleData = new Float32Array(N_PARTICLES * PARTICLE_SIZE);
+    for (let i = 0; i < N_PARTICLES; i++) {
+        particleData[i * PARTICLE_SIZE + 0] = Math.random() / 2;
+        particleData[i * PARTICLE_SIZE + 1] = Math.random();
+        particleData[i * PARTICLE_SIZE + 2] = (Math.random() - 0.5) / 50;
+        particleData[i * PARTICLE_SIZE + 3] = (Math.random() - 0.5) / 50;
+    }
+
+    const particleBuffers = []
+    for (let i = 0; i < 2; i ++) {
+        particleBuffers.push(device.createBuffer({
+            size: N_PARTICLES * PARTICLE_SIZE * 4,
+            usage: GPUBufferUsage.VERTEX | GPUBufferUsage.STORAGE | GPUBufferUsage.TRANSFER_DST
+        }));
+        particleBuffers[i].setSubData(0, particleData);
+    }
+    function swapParticles() {
+        particleBuffers0 = particleBuffers[0];
+        particleBuffers[0] = particleBuffers[1];
+        particleBuffers[1] = particleBuffers0;
+    }
+
+    const gridCountBuffer = device.createBuffer({
+        size: N_GRID_CELLS * 4,
+        usage: GPUBufferUsage.STORAGE,
+    });
+    const gridPrefixSumBuffer = device.createBuffer({
+        size: N_GRID_CELLS * 4,
+        usage: GPUBufferUsage.STORAGE,
+    });
+
+    // -------------------------------------------- FRAME
+    function frame() {
+        const encoder = device.createCommandEncoder({});
+        // Advect particles based on the force computed
+        {
+            const bindGroup = device.createBindGroup({
+                layout: advectionBGL,
+                bindings: [
+                    {binding: 0, resource: {buffer: constantsBuffer, offset: 0, size: constantsData.length * 4}},
+                    {binding: 1, resource: {buffer: particleBuffers[0], offset: 0, size: N_PARTICLES * PARTICLE_SIZE * 4}},
+                    {binding: 2, resource: {buffer: particleBuffers[1], offset: 0, size: N_PARTICLES * PARTICLE_SIZE * 4}},
+                ],
+            });
+
+            const pass = encoder.beginComputePass();
+            pass.setPipeline(advectionPipeline);
+            pass.setBindGroup(0, bindGroup);
+            pass.dispatch(N_PARTICLES);
+            pass.endPass();
+
+            swapParticles();
+        }
+        // Compute number of particles in each grid cell.
+        {
+            const zeroBindGroup = device.createBindGroup({
+                layout: zeroBufferBGL,
+                bindings: [
+                    {binding: 0, resource: {buffer: gridCountBuffer, offset: 0, size: N_GRID_CELLS * 4}},
+                ],
+            });
+
+            const zeroPass = encoder.beginComputePass();
+            zeroPass.setPipeline(zeroBufferPipeline);
+            zeroPass.setBindGroup(0, zeroBindGroup);
+            zeroPass.dispatch(N_GRID_CELLS);
+            zeroPass.endPass();
+
+            const countBindGroup = device.createBindGroup({
+                layout: countParticlesBGL,
+                bindings: [
+                    {binding: 0, resource: {buffer: constantsBuffer, offset: 0, size: constantsData.length * 4}},
+                    {binding: 1, resource: {buffer: particleBuffers[0], offset: 0, size: N_PARTICLES * PARTICLE_SIZE * 4}},
+                    {binding: 2, resource: {buffer: gridCountBuffer, offset: 0, size: N_GRID_CELLS * 4}},
+                ],
+            });
+
+            const countPass = encoder.beginComputePass();
+            countPass.setPipeline(countParticlesPipeline);
+            countPass.setBindGroup(0, countBindGroup);
+            countPass.dispatch(N_PARTICLES);
+            countPass.endPass();
+        }
+        // Compute prefix sum of the grid.
+        {
+            const bindGroup = device.createBindGroup({
+                layout: prefixSumBGL,
+                bindings: [
+                    {binding: 0, resource: {buffer: gridCountBuffer, offset: 0, size: N_GRID_CELLS * 4}},
+                    {binding: 1, resource: {buffer: gridPrefixSumBuffer, offset: 0, size: N_GRID_CELLS * 4}},
+                ],
+            });
+
+            const pass = encoder.beginComputePass();
+            pass.setPipeline(prefixSumPipeline);
+            pass.setBindGroup(0, bindGroup);
+            pass.dispatch(256);
+            pass.endPass();
+        }
+        // Reorder particles based on prefix count.
+        {
+            const zeroBindGroup = device.createBindGroup({
+                layout: zeroBufferBGL,
+                bindings: [
+                    {binding: 0, resource: {buffer: gridCountBuffer, offset: 0, size: N_GRID_CELLS * 4}},
+                ],
+            });
+
+            const zeroPass = encoder.beginComputePass();
+            zeroPass.setPipeline(zeroBufferPipeline);
+            zeroPass.setBindGroup(0, zeroBindGroup);
+            zeroPass.dispatch(N_GRID_CELLS);
+            zeroPass.endPass();
+
+            const reorderBindGroup = device.createBindGroup({
+                layout: reorderParticlesBGL,
+                bindings: [
+                    {binding: 0, resource: {buffer: constantsBuffer, offset: 0, size: constantsData.length * 4}},
+                    {binding: 1, resource: {buffer: particleBuffers[0], offset: 0, size: N_PARTICLES * PARTICLE_SIZE * 4}},
+                    {binding: 2, resource: {buffer: particleBuffers[1], offset: 0, size: N_PARTICLES * PARTICLE_SIZE * 4}},
+                    {binding: 3, resource: {buffer: gridPrefixSumBuffer, offset: 0, size: N_GRID_CELLS * 4}},
+                    {binding: 4, resource: {buffer: gridCountBuffer, offset: 0, size: N_GRID_CELLS * 4}},
+                ],
+            });
+
+            const reorderPass = encoder.beginComputePass();
+            reorderPass.setPipeline(reorderParticlesPipeline);
+            reorderPass.setBindGroup(0, reorderBindGroup);
+            reorderPass.dispatch(N_PARTICLES);
+            reorderPass.endPass();
+
+            swapParticles();
+        }
+        // Render everything.
+        {
+            const metaballBindGroup = device.createBindGroup({
+                layout: metaballBGL,
+                bindings: [
+                    {binding: 0, resource: {buffer: constantsBuffer, offset: 0, size: constantsData.length * 4}},
+                    {binding: 1, resource: {buffer: particleBuffers[0], offset: 0, size: N_PARTICLES * PARTICLE_SIZE * 4}},
+                    {binding: 2, resource: {buffer: gridPrefixSumBuffer, offset: 0, size: N_GRID_CELLS * 4}},
+                    {binding: 3, resource: {buffer: gridCountBuffer, offset: 0, size: N_GRID_CELLS * 4}},
+                ],
+            });
+
+            const metaPass = encoder.beginRenderPass({
+                colorAttachments: [{
+                    attachment: swapChain.getCurrentTexture().createDefaultView(),
+                    loadOp: "clear",
+                    storeOp: "store",
+                    clearColor: {r:0.0, g:0.0, b:0.0, a:1.0},
+                }]
+            });
+            metaPass.setPipeline(metaballPipeline);
+            metaPass.setBindGroup(0, metaballBindGroup);
+            metaPass.draw(4, 1, 0, 0);
+            metaPass.endPass();
+
+            const dotsPass = encoder.beginRenderPass({
+                colorAttachments: [{
+                    attachment: swapChain.getCurrentTexture().createDefaultView(),
+                    loadOp: "load",
+                    storeOp: "store",
+                    clearColor: {r:0.0, g:0.0, b:0.0, a:1.0},
+                }]
+            });
+            dotsPass.setVertexBuffers(0, [particleBuffers[0]], [0]);
+            dotsPass.setPipeline(dotsPipeline);
+            dotsPass.draw(N_PARTICLES, 1, 0, 0);
+            dotsPass.endPass();
+        }
+
+        device.getQueue().submit([encoder.finish()]);
+        requestAnimationFrame(frame);
+    }
+    requestAnimationFrame(frame);
+}
+
+init();
+
+</script>
+</body>
+</html>
