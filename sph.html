@@ -101,14 +101,18 @@ struct Constants {
     float epsilon;
     float metaballVolumeThreshold;
     float metaballSurfaceThreshold;
+    float particleRadius;
+    float celerity;
+    float rho0;
+    float mu;
 };
 `;
 const PARTICLE_SIZE = 12 // sizeof Particle / sizeof float;
 const N_PARTICLES_SQRT = 150;
 const N_PARTICLES = N_PARTICLES_SQRT * N_PARTICLES_SQRT;
-const GRID_SIZE = N_PARTICLES_SQRT * 2;
+const GRID_SIZE = N_PARTICLES_SQRT;// * 2;
 const N_GRID_CELLS = GRID_SIZE * GRID_SIZE;
-const RADIUS = 1.0 / 2 / GRID_SIZE * 3 * 2;
+const RADIUS = 1.0 / 2 / GRID_SIZE * 3 * 2; // Where does this come from?
 const INTERACTION_RADIUS = 0.03333;
 //const META_THRESHOLD = 100000.0;
 
@@ -211,8 +215,8 @@ async function init() {
             vec2 pos = gl_FragCoord.xy / constants.screenSize;
             ivec2 gridPos = ivec2(floor(pos * constants.gridSize));
 
-            ivec2 start = max(ivec2(0), gridPos - ivec2(4));
-            ivec2 end = min(ivec2(constants.gridSize), gridPos + ivec2(5));
+            ivec2 start = max(ivec2(0), gridPos - ivec2(0));
+            ivec2 end = min(ivec2(constants.gridSize), gridPos + ivec2(1));
             for (uint x = start.x; x < end.x; x++) {
                 for (uint y = start.y; y < end.y; y++) {
                     uint cellIndex = x + constants.gridSize * y;
@@ -221,6 +225,11 @@ async function init() {
                     for (uint i = 0; i < particleCount; i++) {
                         vec2 particlePos = particles[offset + i].pos;
                         vec2 diff = particlePos - pos;
+                        float weight = particles[offset + i].average_weight;
+                        if (weight < 1.0 || weight > 8.0) {
+                            fragColor = vec4(1.0, 0.0, 0.0, 1.0);
+                            return;
+                        }
                         squareSum += 1.0 / max(constants.epsilon, dot(diff, diff));
                         if (squareSum > constants.metaballVolumeThreshold) {
                             fragColor = vec4(0.15, 0.3, 0.6, 1.0);
@@ -298,6 +307,8 @@ async function init() {
             particle.vel += acceleration * constants.mass * constants.timestep;
             particle.vel.y -= constants.g * constants.timestep / 100.0; // Why?
             particle.pos += particle.vel * constants.timestep;
+            particle.accel = vec2(0.0);
+            particle.force = vec2(0.0);
 
             // Elastic bouncing over the boundaries
             vec2 newPos = clamp(particle.pos, constants.epsilon, 1.0 - constants.epsilon);
@@ -507,6 +518,255 @@ async function init() {
         },
     });
 
+    // -------------------------------------------- COMPUTE WEIGHT (AND PRESSURE).
+    const computeWeightCSCode = SHADER_HEADER + `
+        layout(std140, set = 0, binding = 0) uniform Uniforms {
+            Constants constants;
+        };
+
+        layout(std430, set = 0, binding = 1) buffer ParticlesIn {
+            Particle particlesIn[];
+        };
+
+        layout(std430, set = 0, binding = 2) buffer ParticlesOut {
+            Particle particlesOut[];
+        };
+
+        layout(std430, set = 0, binding = 3) buffer Prefixes {
+            uint gridPrefixSum[];
+        };
+
+        layout(std430, set = 0, binding = 4) buffer CountsOut {
+            uint gridCounts[];
+        };
+
+        float W(float dist, float h) {
+            float x = dist / h;
+            if (x < 0.5f) {
+                return 1 + 6 * x * x * (x - 1);
+            } else if(x < 1.0f) {
+                const float y = 1 - x;
+                return 2 * y * y * y;
+            } else {
+                return 0;
+            }
+        }
+
+        void main() {
+            uint index = gl_GlobalInvocationID.x;
+            Particle particle = particlesIn[index];
+            vec2 startPos = particle.pos - vec2(constants.particleRadius);
+            vec2 endPos = particle.pos + vec2(constants.particleRadius);
+
+            float weight = 0.0;
+            ivec2 start = max(ivec2(0.0), ivec2(floor(startPos * constants.gridSize)));
+            ivec2 end = min(ivec2(constants.gridSize), ivec2(ceil(endPos * constants.gridSize)));
+
+            // Horrible workaround for compiler bug with the three nested loops
+            // for (uint x = start.x; x < end.x; x++) {
+            //     for (uint y = start.y; y < end.y; y++) {
+            ivec2 zone = end - start;
+            int x = -1;
+            int y = 0;
+            for (int w = 0; w < zone.x * zone.y; w++) {
+                x++;
+                if (x >= zone.x) {
+                    y++;
+                    x = 0;
+                }
+
+                uint cellIndex = (x + start.x) + constants.gridSize * (y + start.y);
+                uint offset = gridPrefixSum[cellIndex];
+                uint particleCount = gridCounts[cellIndex];
+                for (uint i = 0; i < particleCount; i++) {
+                    float dist = distance(particlesIn[offset + i].pos, particle.pos);
+                    weight += W(dist, constants.particleRadius);
+                }
+            }
+
+            particle.average_weight = weight;
+            particle.pressure = constants.celerity * constants.celerity * (weight - constants.rho0);
+            particlesOut[index] = particle;
+        }
+    `;
+    const computeWeightBGL = device.createBindGroupLayout({
+        bindings: [
+            { binding: 0, visibility: GPUShaderStageBit.COMPUTE, type: "uniform-buffer" },
+            { binding: 1, visibility: GPUShaderStageBit.COMPUTE, type: "storage-buffer" },
+            { binding: 2, visibility: GPUShaderStageBit.COMPUTE, type: "storage-buffer" },
+            { binding: 3, visibility: GPUShaderStageBit.COMPUTE, type: "storage-buffer" },
+            { binding: 4, visibility: GPUShaderStageBit.COMPUTE, type: "storage-buffer" },
+        ]
+    });
+    const computeWeightPipeline = device.createComputePipeline({
+        layout: device.createPipelineLayout({ bindGroupLayouts: [computeWeightBGL] }),
+        computeStage: {
+            module: compileShaderModule(device, "c", computeWeightCSCode),
+            entryPoint: "main",
+        },
+    });
+
+    // -------------------------------------------- COMPUTE ACCELERATION
+    const computeAccelCSCode = SHADER_HEADER + `
+        layout(std140, set = 0, binding = 0) uniform Uniforms {
+            Constants constants;
+        };
+
+        layout(std430, set = 0, binding = 1) buffer ParticlesIn {
+            Particle particlesIn[];
+        };
+
+        layout(std430, set = 0, binding = 2) buffer ParticlesOut {
+            Particle particlesOut[];
+        };
+
+        layout(std430, set = 0, binding = 3) buffer Prefixes {
+            uint gridPrefixSum[];
+        };
+
+        layout(std430, set = 0, binding = 4) buffer CountsOut {
+            uint gridCounts[];
+        };
+
+//        float dW(float x) {
+//            if (x < 0.5f) {
+//                return (18 * x - 12) * x / constants.particleRadius;
+//            } else if(x < 1.0f) {
+//                const float y = 1 - x;
+//                return - 4 / constants.particleRadius * y * y;
+//            } else {
+//                return 0;
+//            }
+//        }
+//
+//        float laplacianW(float x) {
+//            float result;
+//            if (x < 0.5f) {
+//                result = (36 * x - 12) / constants.particleRadius / constants.particleRadius;
+//            } else if(x < 1.0f) {
+//                const float y = 1 - x;
+//                result = - 4 / constants.particleRadius / constants.particleRadius * y;
+//            } else {
+//                return 0;
+//            }
+//            return result + dW(x) / max(0.000001, x);
+//        }
+float dW(float dist, float h){
+    const float x = dist / h;
+    if(x < 0.5f){
+        return (18 * x - 12) * x / h;
+    }else if(x < 1.0f){
+        const float y = 1 - x;
+        return - 4 / h * y * y;
+    }else{
+        return 0;
+    }
+}
+
+float laplacianW(float dist, float h){
+    const float x = dist / h;
+    float result;
+    if(x < 0.5f){
+        result = (36 * x - 12) / h / h;
+    }else if(x < 1.0f){
+        const float y = 1 - x;
+        result = - 4 / h / h * y;
+    }else{
+        return 0;
+    }
+    return result + dW(dist, h) / max(0.000001, x);
+}
+
+        void main() {
+            uint index = gl_GlobalInvocationID.x;
+            Particle particle = particlesIn[index];
+            vec2 startPos = particle.pos - vec2(constants.particleRadius);
+            vec2 endPos = particle.pos + vec2(constants.particleRadius);
+
+            //vec2 accel = vec2(0.0);
+            ivec2 start = max(ivec2(0.0), ivec2(floor(startPos * constants.gridSize)));
+            ivec2 end = min(ivec2(constants.gridSize), ivec2(ceil(endPos * constants.gridSize)));
+
+            float accelx = 0.0f;
+            float accely = 0.0f;
+
+            float posx = particle.pos.x;
+            float posy = particle.pos.y;
+            float speedx = particle.vel.x;
+            float speedy = particle.vel.y;
+            float own_w = particle.average_weight;
+            float own_p = particle.pressure;
+
+            // Horrible workaround for compiler bug with the three nested loops
+            // for (uint x = start.x; x < end.x; x++) {
+            //     for (uint y = start.y; y < end.y; y++) {
+            ivec2 zone = end - start;
+            int x = -1;
+            int y = 0;
+            for (int w = 0; w < zone.x * zone.y; w++) {
+                x++;
+                if (x >= zone.x) {
+                    y++;
+                    x = 0;
+                }
+
+                uint cellIndex = x + constants.gridSize * y;
+                uint offset = gridPrefixSum[cellIndex];
+                uint particleCount = gridCounts[cellIndex];
+                for (uint i = 0; i < particleCount; i++) {
+                    if (offset + i == index) {
+                        continue;
+                    }
+                    Particle other = particlesIn[offset + i];
+                    float dx = posx - other.pos.x;
+                    float dy = posy - other.pos.y;
+                    float dvx = other.vel.x - speedx;
+                    float dvy = other.vel.y - speedy;
+                    float other_w = other.average_weight;
+                    float other_p = other.pressure;
+                    float dist = sqrt(dx * dx + dy * dy);
+                    float pressureFactor = - (own_p / own_w / own_w + other_p / other_w / other_w) / max(0.00000001, dist) * dW(dist, constants.particleRadius);
+                    //float viscosityFactor = constants.mu * constants.mass / own_w / other_w * laplacianW(dist, constants.particleRadius) * -1000;
+                    float viscosityFactor = 0;
+
+                    float wallFactor = 1.0;
+                    // if(posx + dx < 0.0 || posx + dx > 1.0 || posy + dy < 0.0 || posy + dy > 1.0){
+                    //     wallFactor = - 0.2;
+                    // }
+
+                    accelx += (dx * pressureFactor + dvx * viscosityFactor) * wallFactor;
+                    accely += (dy * pressureFactor + dvy * viscosityFactor) * wallFactor;
+                    //float dist = distance(other.pos, particle.pos);
+                    //float normalizedDist = dist / constants.particleRadius;
+                    //float pressureFactor = - (particle.pressure / particle.average_weight / particle.average_weight + other.pressure / other.average_weight / other.average_weight) / max(0.00000001, dist) * dW(normalizedDist);
+                    //accel += (particle.pos - other.pos) * pressureFactor;
+                    //float viscosityFactor = constants.mu * constants.mass / particle.average_weight / other.average_weight * laplacianW(normalizedDist);
+                    //accel += (particle.vel - other.vel) * viscosityFactor;
+                }
+            }
+
+            particle.accel.x = clamp(-10000, 10000, accelx);
+            particle.accel.y = clamp(-10000, 10000, accely);
+            particlesOut[index] = particle;
+        }
+    `;
+    const computeAccelBGL = device.createBindGroupLayout({
+        bindings: [
+            { binding: 0, visibility: GPUShaderStageBit.COMPUTE, type: "uniform-buffer" },
+            { binding: 1, visibility: GPUShaderStageBit.COMPUTE, type: "storage-buffer" },
+            { binding: 2, visibility: GPUShaderStageBit.COMPUTE, type: "storage-buffer" },
+            { binding: 3, visibility: GPUShaderStageBit.COMPUTE, type: "storage-buffer" },
+            { binding: 4, visibility: GPUShaderStageBit.COMPUTE, type: "storage-buffer" },
+        ]
+    });
+    const computeAccelPipeline = device.createComputePipeline({
+        layout: device.createPipelineLayout({ bindGroupLayouts: [computeAccelBGL] }),
+        computeStage: {
+            module: compileShaderModule(device, "c", computeAccelCSCode),
+            entryPoint: "main",
+        },
+    });
+
     // -------------------------------------------- BUFFER SETUP
     const constantsData = new Float32Array([
         0, 0, // screenSize
@@ -517,6 +777,10 @@ async function init() {
         0.0000001, // epsilon
         100000.0, // metaballVolumeThreshold
         25000.0, // metaballSurfaceThreshold
+        RADIUS, // particleRadius
+        3.0, // celerity
+        2.0, // rho0
+        1.0, // mu
     ]);
     const constantsDataUint = new Uint32Array(constantsData.buffer);
     constantsDataUint[0] = 800;
@@ -563,25 +827,6 @@ async function init() {
     // -------------------------------------------- FRAME
     function frame() {
         const encoder = device.createCommandEncoder({});
-        // Advect particles based on the force computed
-        {
-            const bindGroup = device.createBindGroup({
-                layout: advectionBGL,
-                bindings: [
-                    {binding: 0, resource: {buffer: constantsBuffer, offset: 0, size: constantsData.length * 4}},
-                    {binding: 1, resource: {buffer: particleBuffers[0], offset: 0, size: N_PARTICLES * PARTICLE_SIZE * 4}},
-                    {binding: 2, resource: {buffer: particleBuffers[1], offset: 0, size: N_PARTICLES * PARTICLE_SIZE * 4}},
-                ],
-            });
-
-            const pass = encoder.beginComputePass();
-            pass.setPipeline(advectionPipeline);
-            pass.setBindGroup(0, bindGroup);
-            pass.dispatch(N_PARTICLES);
-            pass.endPass();
-
-            swapParticles();
-        }
         // Compute number of particles in each grid cell.
         {
             const zeroBindGroup = device.createBindGroup({
@@ -699,6 +944,67 @@ async function init() {
             dotsPass.setPipeline(dotsPipeline);
             dotsPass.draw(N_PARTICLES, 1, 0, 0);
             dotsPass.endPass();
+        }
+        // Compute the average weights
+        {
+            const computeWeightBindGroup = device.createBindGroup({
+                layout: computeWeightBGL,
+                bindings: [
+                    {binding: 0, resource: {buffer: constantsBuffer, offset: 0, size: constantsData.length * 4}},
+                    {binding: 1, resource: {buffer: particleBuffers[0], offset: 0, size: N_PARTICLES * PARTICLE_SIZE * 4}},
+                    {binding: 2, resource: {buffer: particleBuffers[1], offset: 0, size: N_PARTICLES * PARTICLE_SIZE * 4}},
+                    {binding: 3, resource: {buffer: gridPrefixSumBuffer, offset: 0, size: N_GRID_CELLS * 4}},
+                    {binding: 4, resource: {buffer: gridCountBuffer, offset: 0, size: N_GRID_CELLS * 4}},
+                ],
+            });
+
+            const reorderPass = encoder.beginComputePass();
+            reorderPass.setPipeline(computeWeightPipeline);
+            reorderPass.setBindGroup(0, computeWeightBindGroup);
+            reorderPass.dispatch(N_PARTICLES);
+            reorderPass.endPass();
+
+            swapParticles();
+        }
+        // Compute the acceleration
+        if (false) {
+            const computeAccelBindGroup = device.createBindGroup({
+                layout: computeAccelBGL,
+                bindings: [
+                    {binding: 0, resource: {buffer: constantsBuffer, offset: 0, size: constantsData.length * 4}},
+                    {binding: 1, resource: {buffer: particleBuffers[0], offset: 0, size: N_PARTICLES * PARTICLE_SIZE * 4}},
+                    {binding: 2, resource: {buffer: particleBuffers[1], offset: 0, size: N_PARTICLES * PARTICLE_SIZE * 4}},
+                    {binding: 3, resource: {buffer: gridPrefixSumBuffer, offset: 0, size: N_GRID_CELLS * 4}},
+                    {binding: 4, resource: {buffer: gridCountBuffer, offset: 0, size: N_GRID_CELLS * 4}},
+                ],
+            });
+
+            const reorderPass = encoder.beginComputePass();
+            reorderPass.setPipeline(computeAccelPipeline);
+            reorderPass.setBindGroup(0, computeAccelBindGroup);
+            reorderPass.dispatch(N_PARTICLES);
+            reorderPass.endPass();
+
+            swapParticles();
+        }
+        // Advect particles based on the force computed
+        if (false) {
+            const bindGroup = device.createBindGroup({
+                layout: advectionBGL,
+                bindings: [
+                    {binding: 0, resource: {buffer: constantsBuffer, offset: 0, size: constantsData.length * 4}},
+                    {binding: 1, resource: {buffer: particleBuffers[0], offset: 0, size: N_PARTICLES * PARTICLE_SIZE * 4}},
+                    {binding: 2, resource: {buffer: particleBuffers[1], offset: 0, size: N_PARTICLES * PARTICLE_SIZE * 4}},
+                ],
+            });
+
+            const pass = encoder.beginComputePass();
+            pass.setPipeline(advectionPipeline);
+            pass.setBindGroup(0, bindGroup);
+            pass.dispatch(N_PARTICLES);
+            pass.endPass();
+
+            swapParticles();
         }
 
         device.getQueue().submit([encoder.finish()]);
