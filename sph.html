@@ -3,83 +3,49 @@
 <head>
 <meta name="viewport" content="width=600">
 <title>WebGPU SPH</title>
-<script src="third_party/shaderc/shaderc.js"></script>
+<script src="dist/utils.js"></script>
 </head>
 <body>
 <canvas height=800 width=800></canvas>
 <script>
-async function testPrefixSum(device, pipeline, bgl, testSize, factor) {
+async function testPrefixSum(device, doPrefixSum, testSize) {
     const testData = [];
     for (let i = 0; i < testSize; i++) {
         testData.push(Math.floor(Math.random() * 1000));
     }
     const testBuffer = device.createBuffer({
         size: testSize * 4,
-        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.TRANSFER_DST,
+        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.TRANSFER_DST | GPUBufferUsage.TRANSFER_SRC,
     });
     testBuffer.setSubData(0, new Uint32Array(testData));
 
-    const resultBuffer = device.createBuffer({
-        size: testSize * 4,
-        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.TRANSFER_SRC
-    });
+    const encoder = device.createCommandEncoder({});
+    doPrefixSum(device, encoder, testBuffer, testSize);
+
     const readbackBuffer = device.createBuffer({
         size: testSize * 4,
         usage: GPUBufferUsage.TRANSFER_DST | GPUBufferUsage.MAP_READ
     });
+    encoder.copyBufferToBuffer(testBuffer, 0, readbackBuffer, 0, testSize * 4);
 
-    const encoder = device.createCommandEncoder({});
-
-    const bindGroup = device.createBindGroup({
-        layout: bgl,
-        bindings: [
-            {binding: 0, resource: {buffer: testBuffer, offset: 0, size: testSize * 4}},
-            {binding: 1, resource: {buffer: resultBuffer, offset: 0, size: testSize * 4}},
-        ],
-    });
-
-    const pass = encoder.beginComputePass();
-    pass.setPipeline(pipeline);
-    pass.setBindGroup(0, bindGroup);
-    pass.dispatch(factor);
-    pass.endPass();
-
-    encoder.copyBufferToBuffer(resultBuffer, 0, readbackBuffer, 0, testSize * 4);
     console.log("testing")
     device.getQueue().submit([encoder.finish()]);
 
     const resultData = new Uint32Array(await readbackBuffer.mapReadAsync());
 
     let sum = 0;
-    for (let i = 0; i < testSize; i++) {
-        if (resultData[i] != sum) {
-            console.log(i, "error ", resultData[i], " " , sum);
-        }
+    for (let i = 0; i < testSize - 1; i++) {
         sum += testData[i];
+        if (resultData[i] != sum) {
+            console.log(i, "error ", testData[i], " ", resultData[i], " " , sum);
+        }
     }
-    console.log("test ok");
+    console.log("test done");
 }
 
 function compileShaderModule(device, type, source) {
-    const Shaderc = window.Module;
-
-    const compiler = new Shaderc.Compiler();
-    const opts = new Shaderc.CompileOptions();
-    const result = compiler.CompileGlslToSpv("#version 450\n" + source,
-        type === "f" ? Shaderc.shader_kind.fragment :
-        type === "v" ? Shaderc.shader_kind.vertex :
-        type === "c" ? Shaderc.shader_kind.compute : null,
-        "a.glsl", "main", opts);
-    const message = result.GetErrorMessage();
-    if (message != "") {
-        console.warn(message);
-    }
-    return device.createShaderModule({code: result.GetBinary()});
+    return device.createShaderModule({code: Utils.compile(type, "#version 450\n" + source)});
 }
-
-const onRuntimeInitialized = new Promise(resolve => {
-    Module.onRuntimeInitialized = resolve;
-});
 
 const SHADER_HEADER = `
 struct Particle {
@@ -127,9 +93,9 @@ const N_GRID_CELLS = GRID_SIZE * GRID_SIZE;
 const RADIUS = 3.0 / GRID_SIZE;
 
 async function init() {
-    await onRuntimeInitialized;
     const adapter = await navigator.gpu.requestAdapter();
     const device = await adapter.requestDevice();
+    await Utils.ready;
 
     const canvas = document.querySelector('canvas');
     const context = canvas.getContext('gpupresent');
@@ -355,6 +321,128 @@ async function init() {
         },
     });
 
+    // -------------------------------------------- PREFIX SUM
+    const PREFIX_SHARED_HEADER = `
+        layout(std140, set = 0, binding = 0) uniform Uniforms {
+            uint dataLength;
+            uint coarseStride;
+            uint smallStride;
+        };
+
+        layout(std430, set = 0, binding = 1) buffer Data {
+            uint data[];
+        };
+    `;
+    const prefixCoarseSumCSCode = PREFIX_SHARED_HEADER + `
+        void main() {
+            uint index = gl_GlobalInvocationID.x;
+
+            uint rangeStart = index * coarseStride;
+            uint rangeEnd = rangeStart + coarseStride;
+
+            uint sum = 0;
+            for (uint i = rangeStart; i < rangeEnd; i += smallStride) {
+                sum += data[i + smallStride - 1];
+            }
+
+            data[rangeEnd - 1] = sum;
+        }
+    `;
+    const prefixCoarseSumBGL = device.createBindGroupLayout({
+        bindings: [
+            { binding: 0, visibility: GPUShaderStageBit.COMPUTE, type: "uniform-buffer" },
+            { binding: 1, visibility: GPUShaderStageBit.COMPUTE, type: "storage-buffer" },
+        ]
+    });
+    const prefixCoarseSumPipeline = device.createComputePipeline({
+        layout: device.createPipelineLayout({ bindGroupLayouts: [prefixCoarseSumBGL] }),
+        computeStage: {
+            module: compileShaderModule(device, "c", prefixCoarseSumCSCode),
+            entryPoint: "main",
+        },
+    });
+
+    const prefixExpandSumCSCode = PREFIX_SHARED_HEADER + `
+        void main() {
+            uint index = gl_GlobalInvocationID.x;
+
+            uint rangeStart = index * coarseStride;
+            uint rangeEnd = min(dataLength, rangeStart + coarseStride - smallStride);
+
+            uint prefixSum;
+            if (rangeStart == 0) {
+                prefixSum = 0;
+            } else {
+                prefixSum = data[rangeStart - 1];
+            }
+
+            for (uint i = rangeStart; i < rangeEnd; i += smallStride) {
+                prefixSum += data[i + smallStride - 1];
+                data[i + smallStride - 1] = prefixSum;
+            }
+        }
+    `;
+    const prefixExpandSumBGL = device.createBindGroupLayout({
+        bindings: [
+            { binding: 0, visibility: GPUShaderStageBit.COMPUTE, type: "uniform-buffer" },
+            { binding: 1, visibility: GPUShaderStageBit.COMPUTE, type: "storage-buffer" },
+        ]
+    });
+    const prefixExpandSumPipeline = device.createComputePipeline({
+        layout: device.createPipelineLayout({ bindGroupLayouts: [prefixExpandSumBGL] }),
+        computeStage: {
+            module: compileShaderModule(device, "c", prefixExpandSumCSCode),
+            entryPoint: "main",
+        },
+    });
+
+    function inPlacePrefixSum(device, encoder, buffer, size) {
+        function prefixSumHelper(smallStride) {
+            const REDUCTION_FACTOR = 8;
+            const coarseStride = smallStride * REDUCTION_FACTOR;
+
+            const uniforms = device.createBuffer({
+                size: 12,
+                usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.TRANSFER_DST
+            });
+            uniforms.setSubData(0, new Uint32Array([size, coarseStride, smallStride]));
+
+            const bindGroup = device.createBindGroup({
+                layout: prefixCoarseSumBGL,
+                bindings: [
+                    {binding: 0, resource: {buffer: uniforms, offset: 0, size: 12}},
+                    {binding: 1, resource: {buffer: buffer, offset: 0, size: size * 4}},
+                ],
+            });
+
+            if (coarseStride < size) {
+                // The number of element at a coarseStride stride except the first one.
+                const dispatchSize = Math.floor((size - 1) / coarseStride);
+
+                const pass = encoder.beginComputePass();
+                pass.setPipeline(prefixCoarseSumPipeline);
+                pass.setBindGroup(0, bindGroup);
+                pass.dispatch(dispatchSize);
+                pass.endPass();
+
+                prefixSumHelper(coarseStride);
+            }
+
+            {
+                const dispatchSize = Math.ceil(size / coarseStride);
+
+                const pass = encoder.beginComputePass();
+                pass.setPipeline(prefixExpandSumPipeline);
+                pass.setBindGroup(0, bindGroup);
+                pass.dispatch(dispatchSize + 1);
+                pass.endPass();
+            }
+        }
+        prefixSumHelper(1);
+    }
+
+    // await testPrefixSum(device, inPlacePrefixSum, N_GRID_CELLS);
+
     // -------------------------------------------- SINGLE DISPATCH PREFIX SUM (SLOW!!!!)
     const prefixSumCSCode = `
         layout(std430, set = 0, binding = 0) buffer DataIn {
@@ -370,7 +458,7 @@ async function init() {
         shared uint coarsePrefixes[kFactor];
 
         void main() {
-            uint dataLength = ${N_GRID_CELLS};// dataIn.data.length(); // XXX roll shaderc to fix this.
+            uint dataLength = ${N_GRID_CELLS}; // SPIRV-Cross doesn't know how to do dataIn.length();
             uint groupSize = (dataLength + kFactor - 1) / kFactor;
             uint index = gl_GlobalInvocationID.x;
 
@@ -421,7 +509,6 @@ async function init() {
         },
     });
 
-    // await testPrefixSum(device, prefixSumPipeline, prefixSumBGL, N_GRID_CELLS, 256)
 
     // -------------------------------------------- COUNT PARTICLES
     const countParticlesCSCode = SHADER_HEADER + `
