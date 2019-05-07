@@ -176,6 +176,9 @@ async function init() {
         layout(std430, set = 0, binding = 2) buffer Prefixes {
             uint gridPrefixSum[];
         };
+        uint getGridPrefixSum(uint cellIndex) {
+            return cellIndex == 0 ? 0 : gridPrefixSum[cellIndex - 1];
+        }
 
         layout(std430, set = 0, binding = 3) buffer CountsOut {
             uint gridCounts[];
@@ -192,7 +195,7 @@ async function init() {
             for (uint x = start.x; x < end.x; x++) {
                 for (uint y = start.y; y < end.y; y++) {
                     uint cellIndex = x + constants.gridSize * y;
-                    uint offset = gridPrefixSum[cellIndex];
+                    uint offset = getGridPrefixSum(cellIndex);
                     uint particleCount = gridCounts[cellIndex];
                     for (uint i = 0; i < particleCount; i++) {
                         vec2 particlePos = particles[offset + i].pos;
@@ -443,73 +446,6 @@ async function init() {
 
     // await testPrefixSum(device, inPlacePrefixSum, N_GRID_CELLS);
 
-    // -------------------------------------------- SINGLE DISPATCH PREFIX SUM (SLOW!!!!)
-    const prefixSumCSCode = `
-        layout(std430, set = 0, binding = 0) buffer DataIn {
-            uint dataIn[];
-        };
-
-        layout(std430, set = 0, binding = 1) buffer DataOut {
-            uint dataOut[];
-        };
-
-        const uint kFactor = 256;
-        layout(local_size_x = kFactor) in;
-        shared uint coarsePrefixes[kFactor];
-
-        void main() {
-            uint dataLength = ${N_GRID_CELLS}; // SPIRV-Cross doesn't know how to do dataIn.length();
-            uint groupSize = (dataLength + kFactor - 1) / kFactor;
-            uint index = gl_GlobalInvocationID.x;
-
-            if (index != 0) {
-                uint start = (index - 1) * groupSize;
-                uint end = index * groupSize;
-
-                uint sum = 0;
-                for (uint i = start; i < end; i++) {
-                    sum += dataIn[i];
-                }
-                coarsePrefixes[index] = sum;
-            }
-            barrier();
-
-            if (index == 0) {
-                coarsePrefixes[0] = 0;
-
-                uint sum = 0;
-                for (uint i = 1; i < kFactor; i++) {
-                    sum += coarsePrefixes[i];
-                    coarsePrefixes[i] = sum;
-                }
-            }
-            barrier();
-
-            uint start = index * groupSize;
-            uint end = min((index + 1) * groupSize, dataLength);
-
-            uint sum = coarsePrefixes[index];
-            for (uint i = start; i < end; i++) {
-                dataOut[i] = sum;
-                sum += dataIn[i];
-            }
-        }
-    `;
-    const prefixSumBGL = device.createBindGroupLayout({
-        bindings: [
-            { binding: 0, visibility: GPUShaderStageBit.COMPUTE, type: "storage-buffer" },
-            { binding: 1, visibility: GPUShaderStageBit.COMPUTE, type: "storage-buffer" },
-        ]
-    });
-    const prefixSumPipeline = device.createComputePipeline({
-        layout: device.createPipelineLayout({ bindGroupLayouts: [prefixSumBGL] }),
-        computeStage: {
-            module: compileShaderModule(device, "c", prefixSumCSCode),
-            entryPoint: "main",
-        },
-    });
-
-
     // -------------------------------------------- COUNT PARTICLES
     const countParticlesCSCode = SHADER_HEADER + `
         layout(std430, set = 0, binding = 1) buffer ParticlesIn {
@@ -554,8 +490,11 @@ async function init() {
         };
 
         layout(std430, set = 0, binding = 3) buffer Prefixes {
-            uint prefixSum[];
+            uint gridPrefixSum[];
         };
+        uint getGridPrefixSum(uint cellIndex) {
+            return cellIndex == 0 ? 0 : gridPrefixSum[cellIndex - 1];
+        }
 
         layout(std430, set = 0, binding = 4) buffer CountsOut {
             uint counts[];
@@ -567,7 +506,7 @@ async function init() {
 
             uint gridOffset = gridPosToOffset(posToGridPos(pos));
             uint previousCount = atomicAdd(counts[gridOffset], 1);
-            uint newIndex = previousCount + prefixSum[gridOffset];
+            uint newIndex = previousCount + getGridPrefixSum(gridOffset);
             particlesOut[newIndex] = particlesIn[index];
         }
     `;
@@ -599,6 +538,9 @@ async function init() {
         layout(std430, set = 0, binding = 3) buffer Prefixes {
             uint gridPrefixSum[];
         };
+        uint getGridPrefixSum(uint cellIndex) {
+            return cellIndex == 0 ? 0 : gridPrefixSum[cellIndex - 1];
+        }
         layout(std430, set = 0, binding = 4) buffer CountsOut {
             uint gridCounts[];
         };
@@ -624,7 +566,7 @@ async function init() {
             for (uint x = start.x; x <= end.x; x++) {
                 for (uint y = start.y; y <= end.y; y++) {
                     uint gridCellIndex = gridPosToOffset(uvec2(x, y));
-                    uint offset = gridPrefixSum[gridCellIndex];
+                    uint offset = getGridPrefixSum(gridCellIndex);
                     uint particleCount = gridCounts[gridCellIndex];
                     for (uint i = 0; i < particleCount; i++) {
                         float dist = distance(particlesIn[offset + i].pos, particle.pos);
@@ -666,6 +608,9 @@ async function init() {
         layout(std430, set = 0, binding = 3) buffer Prefixes {
             uint gridPrefixSum[];
         };
+        uint getGridPrefixSum(uint cellIndex) {
+            return cellIndex == 0 ? 0 : gridPrefixSum[cellIndex - 1];
+        }
         layout(std430, set = 0, binding = 4) buffer CountsOut {
             uint gridCounts[];
         };
@@ -709,7 +654,7 @@ async function init() {
             for (uint x = start.x; x <= end.x; x++) {
                 for (uint y = start.y; y <= end.y; y++) {
                     uint gridCellIndex = gridPosToOffset(uvec2(x, y));
-                    uint offset = gridPrefixSum[gridCellIndex];
+                    uint offset = getGridPrefixSum(gridCellIndex);
                     uint particleCount = gridCounts[gridCellIndex];
                     for (uint i = 0; i < particleCount; i++) {
                         if (offset + i == index) {
@@ -805,12 +750,12 @@ async function init() {
     // -------------------------------------------- FRAME
     function frame() {
         const encoder = device.createCommandEncoder({});
-        // Compute number of particles in each grid cell.
+        // Compute the prefix sum of the number of particles in each cell.
         {
             const zeroBindGroup = device.createBindGroup({
                 layout: zeroBufferBGL,
                 bindings: [
-                    {binding: 0, resource: {buffer: gridCountBuffer, offset: 0, size: N_GRID_CELLS * 4}},
+                    {binding: 0, resource: {buffer: gridPrefixSumBuffer, offset: 0, size: N_GRID_CELLS * 4}},
                 ],
             });
 
@@ -825,7 +770,7 @@ async function init() {
                 bindings: [
                     {binding: 0, resource: {buffer: constantsBuffer, offset: 0, size: constantsData.length * 4}},
                     {binding: 1, resource: {buffer: particleBuffers[0], offset: 0, size: N_PARTICLES * PARTICLE_SIZE * 4}},
-                    {binding: 2, resource: {buffer: gridCountBuffer, offset: 0, size: N_GRID_CELLS * 4}},
+                    {binding: 2, resource: {buffer: gridPrefixSumBuffer, offset: 0, size: N_GRID_CELLS * 4}},
                 ],
             });
 
@@ -834,22 +779,8 @@ async function init() {
             countPass.setBindGroup(0, countBindGroup);
             countPass.dispatch(N_PARTICLES);
             countPass.endPass();
-        }
-        // Compute prefix sum of the grid.
-        {
-            const bindGroup = device.createBindGroup({
-                layout: prefixSumBGL,
-                bindings: [
-                    {binding: 0, resource: {buffer: gridCountBuffer, offset: 0, size: N_GRID_CELLS * 4}},
-                    {binding: 1, resource: {buffer: gridPrefixSumBuffer, offset: 0, size: N_GRID_CELLS * 4}},
-                ],
-            });
 
-            const pass = encoder.beginComputePass();
-            pass.setPipeline(prefixSumPipeline);
-            pass.setBindGroup(0, bindGroup);
-            pass.dispatch(256);
-            pass.endPass();
+            inPlacePrefixSum(device, encoder, gridPrefixSumBuffer, N_GRID_CELLS);
         }
         // Reorder particles based on prefix count.
         {
