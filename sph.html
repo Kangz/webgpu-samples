@@ -112,8 +112,7 @@ layout(std140, set = 0, binding = 0) uniform Uniforms {
 };
 
 uvec2 posToGridPos(vec2 pos) {
-    pos = clamp(pos, 0.0, 1.0 - constants.epsilon);
-    return ivec2(floor(pos * constants.gridSize));
+    return ivec2(clamp(floor(pos * constants.gridSize), 0, constants.gridSize - 1));
 }
 
 uint gridPosToOffset(uvec2 pos) {
@@ -220,7 +219,7 @@ async function init() {
         void main() {
             float squareSum = 0.0;
             vec2 pos = gl_FragCoord.xy / constants.screenSize;
-            ivec2 gridPos = ivec2(floor(pos * constants.gridSize));
+            ivec2 gridPos = ivec2(posToGridPos(pos));
 
             ivec2 start = max(ivec2(0), gridPos - ivec2(4));
             ivec2 end = min(ivec2(constants.gridSize), gridPos + ivec2(5));
@@ -535,8 +534,8 @@ async function init() {
             uvec2 end = posToGridPos(particle.pos + vec2(constants.particleRadius));
 
             float rho = 0.0;
-            for (uint x = start.x; x < end.x; x++) {
-                for (uint y = start.y; y < end.y; y++) {
+            for (uint x = start.x; x <= end.x; x++) {
+                for (uint y = start.y; y <= end.y; y++) {
                     uint gridCellIndex = gridPosToOffset(uvec2(x, y));
                     uint offset = gridPrefixSum[gridCellIndex];
                     uint particleCount = gridCounts[gridCellIndex];
@@ -583,53 +582,33 @@ async function init() {
         layout(std430, set = 0, binding = 4) buffer CountsOut {
             uint gridCounts[];
         };
-//        float dW(float x) {
-//            if (x < 0.5f) {
-//                return (18 * x - 12) * x / constants.particleRadius;
-//            } else if(x < 1.0f) {
-//                const float y = 1 - x;
-//                return - 4 / constants.particleRadius * y * y;
-//            } else {
-//                return 0;
-//            }
-//        }
-//
-//        float laplacianW(float x) {
-//            float result;
-//            if (x < 0.5f) {
-//                result = (36 * x - 12) / constants.particleRadius / constants.particleRadius;
-//            } else if(x < 1.0f) {
-//                const float y = 1 - x;
-//                result = - 4 / constants.particleRadius / constants.particleRadius * y;
-//            } else {
-//                return 0;
-//            }
-//            return result + dW(x) / max(0.000001, x);
-//        }
-float dW(float dist, float h){
-    const float x = dist / h;
-    if(x < 0.5f){
-        return (18 * x - 12) * x / h;
-    }else if(x < 1.0f){
-        const float y = 1 - x;
-        return - 4 / h * y * y;
-    }else{
-        return 0;
-    }
-}
-float laplacianW(float dist, float h){
-    const float x = dist / h;
-    float result;
-    if(x < 0.5f){
-        result = (36 * x - 12) / h / h;
-    }else if(x < 1.0f){
-        const float y = 1 - x;
-        result = - 4 / h / h * y;
-    }else{
-        return 0;
-    }
-    return result + dW(dist, h) / max(0.000001, x);
-}
+
+        float dW(float dist, float h) {
+            const float x = dist / h;
+            if (x < 0.5f) {
+                return (18 * x - 12) * x / h;
+            } else if(x < 1.0f) {
+                const float y = 1 - x;
+                return - 4 / h * y * y;
+            } else {
+                return 0;
+            }
+        }
+
+        float laplacianW (float dist, float h) {
+            const float x = dist / h;
+            float result;
+            if (x < 0.5f) {
+                result = (36 * x - 12) / h / h;
+            } else if (x < 1.0f) {
+                const float y = 1 - x;
+                result = - 4 / h / h * y;
+            } else {
+                return 0;
+            }
+            return result + dW(dist, h) / max(0.000001, x);
+        }
+
         void main() {
             uint index = gl_GlobalInvocationID.x;
             Particle particle = particlesIn[index];
@@ -639,10 +618,9 @@ float laplacianW(float dist, float h){
 
             // http://matthias-mueller-fischer.ch/publications/sca03.pdf
 
-            float rho = 0.0;
             vec2 accel = vec2(0.0);
-            for (uint x = start.x; x < end.x; x++) {
-                for (uint y = start.y; y < end.y; y++) {
+            for (uint x = start.x; x <= end.x; x++) {
+                for (uint y = start.y; y <= end.y; y++) {
                     uint gridCellIndex = gridPosToOffset(uvec2(x, y));
                     uint offset = gridPrefixSum[gridCellIndex];
                     uint particleCount = gridCounts[gridCellIndex];
@@ -652,8 +630,8 @@ float laplacianW(float dist, float h){
                         }
                         Particle other = particlesIn[offset + i];
                         float dist = distance(other.pos, particle.pos);
-                        vec2 gradientW = - (particle.pos - other.pos) * dW(dist, constants.particleRadius);
-                        accel += (particle.pressure + other.pressure) / 2.0 / other.rho * gradientW;
+                        vec2 gradientW = (other.pos - particle.pos) * dW(dist, constants.particleRadius);
+                        accel += gradientW * (particle.pressure + other.pressure) / (2.0 * other.rho);
                     }
                 }
             }
@@ -858,7 +836,7 @@ float laplacianW(float dist, float h){
             dotsPass.draw(N_PARTICLES, 1, 0, 0);
             dotsPass.endPass();
         }
-        // Compute the average weights
+        // Compute rho and pressure
         {
             const computeWeightBindGroup = device.createBindGroup({
                 layout: computeWeightBGL,
